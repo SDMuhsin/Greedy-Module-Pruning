@@ -1,0 +1,12 @@
+#torch=1.7.1
+torchtext
+torchsummary
+tensorboard
+matplotlib
+transformers
+pandas
+sentencepiece
+datasets
+scikit-learn
+tabulate
+accelerate
