@@ -450,7 +450,10 @@ def greedy_module_prune(config, data_args, model_args, training_args, train_data
             temp_pruning_state = update_pruning_state_prune_layer(temp_pruning_state,layer_idx)
             
             print_pruning_state(temp_pruning_state)
-            exit()
+            
+            prune_and_evaluate_model(temp_pruning_state, config, model_args, data_args,
+                    training_args, train_dataset, eval_dataset, compute_metrics, tokenizer, data_collator, datasets)
+
             # Fine tune and evaluate
 
             # Record performance
@@ -462,6 +465,122 @@ def greedy_module_prune(config, data_args, model_args, training_args, train_data
         num_iterations_left -= 1
 
     return None
+
+def prune_and_evaluate_model(pruning_state, config, model_args, data_args,
+    training_args, train_dataset, eval_dataset, compute_metrics, tokenizer, data_collator,
+    datasets):
+
+    # Set seed before initializing model.
+    set_seed(training_args.seed)
+
+    model = create_model(config, model_args)
+    
+    prune_model_modules(model,pruning_state)
+
+    exit()
+    trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            compute_metrics=compute_metrics,
+            tokenizer=tokenizer,
+            data_collator=data_collator,
+        )
+    trainer.add_callback(
+        DisableCheckpointCallbackHandler()
+    )
+
+    # Training
+    train_result = trainer.train(resume_from_checkpoint=None)
+    metrics = train_result.metrics
+
+    # Evaluation
+    eval_results = {}
+    logger.info("*** Evaluate ***")
+
+    # Loop to handle MNLI double evaluation (matched, mis-matched)
+    tasks = [data_args.task_name]
+    eval_datasets = [eval_dataset]
+    if data_args.task_name == "mnli":
+        tasks.append("mnli-mm")
+        eval_mismatch = datasets["validation_mismatched"]
+        eval_datasets.append(eval_mismatch)
+
+    for eval_dataset, task in zip(eval_datasets, tasks):
+        eval_result = trainer.evaluate(eval_dataset=eval_dataset)
+        eval_results.update(eval_result)
+
+    # res = eval_results.get("eval_loss", None)
+    res = None
+    res = res or eval_results.get("eval_f1", None)
+    res = res or eval_results.get("eval_accuracy", None)
+    res = res or eval_results.get("eval_spearmanr", None)
+    res = res or eval_results.get("eval_matthews_correlation", None)
+
+    res = round(res, 3)
+
+    if(res == None):
+        raise Exception("Now performance metric found!")
+
+    return res
+
+def prune_model_modules(model,model_state):
+    
+    for weight_name,pruning_strat in model_state.items():
+        
+        if(pruning_strat == "NOP"):
+            continue
+        
+        print(f"Pruning weight : {weight_name}")
+
+        param_matrix = get_weight_by_name(model,weight_name)
+        print(f"Before {param_matrix.shape}")
+        pruned_param_matrix = prune_param_matrix(param_matrix,pruning_strat)
+        print(f"After {pruned_param_matrix.shape}")
+        
+def prune_param_matrix(param_matrix, pruning_strat):
+    # Split the pruning strategy into its components
+    parts = pruning_strat.split('-')
+    if len(parts) != 3:
+        raise ValueError("Invalid pruning strategy format. Expected format: <C/R>-<F/L>-<N>")
+    
+    prune_type, prune_position, prune_fraction = parts
+    prune_fraction = int(prune_fraction)
+
+    if prune_type not in ['C', 'R']:
+        raise ValueError("Invalid prune type. Expected 'C' for columns or 'R' for rows.")
+    if prune_position not in ['F', 'L']:
+        raise ValueError("Invalid prune position. Expected 'F' for first or 'L' for last.")
+
+    # Handle 1D tensors (biases)
+    if param_matrix.dim() == 1:
+        num_elements = param_matrix.shape[0]
+        prune_count = num_elements // prune_fraction
+        if prune_position == 'F':
+            pruned_param_matrix = param_matrix[prune_count:]
+        elif prune_position == 'L':
+            pruned_param_matrix = param_matrix[:-prune_count]
+    # Handle 2D tensors (weights)
+    elif param_matrix.dim() == 2:
+        if prune_type == 'C':
+            num_columns = param_matrix.shape[1]
+            prune_count = num_columns // prune_fraction
+            if prune_position == 'F':
+                pruned_param_matrix = param_matrix[:, prune_count:]
+            elif prune_position == 'L':
+                pruned_param_matrix = param_matrix[:, :-prune_count]
+        elif prune_type == 'R':
+            num_rows = param_matrix.shape[0]
+            prune_count = num_rows // prune_fraction
+            if prune_position == 'F':
+                pruned_param_matrix = param_matrix[prune_count:, :]
+            elif prune_position == 'L':
+                pruned_param_matrix = param_matrix[:-prune_count, :]
+    else:
+        raise ValueError("Unsupported tensor dimension. Expected 1D or 2D tensor.")
+
+    return pruned_param_matrix
 
 def update_pruning_state_prune_layer(pruning_state,layer_idx):
 
