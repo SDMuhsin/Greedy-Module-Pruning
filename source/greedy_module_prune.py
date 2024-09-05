@@ -15,7 +15,7 @@
 # limitations under the License.
 """ Finetuning the library models for sequence classification on GLUE."""
 # You can also adapt this script on your own text classification task. Pointers for this are left as comments.
-
+from models.bert.modeling_bert import LowRankBertLayer
 import logging
 import copy
 import os
@@ -451,9 +451,10 @@ def greedy_module_prune(config, data_args, model_args, training_args, train_data
             
             print_pruning_state(temp_pruning_state)
             
-            prune_and_evaluate_model(temp_pruning_state, config, model_args, data_args,
+            res = prune_and_evaluate_model(temp_pruning_state, config, model_args, data_args,
                     training_args, train_dataset, eval_dataset, compute_metrics, tokenizer, data_collator, datasets)
-
+            print("RESULT : ",res)
+            exit()
             # Fine tune and evaluate
 
             # Record performance
@@ -474,10 +475,41 @@ def prune_and_evaluate_model(pruning_state, config, model_args, data_args,
     set_seed(training_args.seed)
 
     model = create_model(config, model_args)
-    
     prune_model_modules(model,pruning_state)
+    
+    ''' Adjust dim params : For each layer, Make a version with reduced dimensions and copy the weights over '''
 
-    exit()
+    print(config)
+    for layer_idx in range(config.num_hidden_layers):
+        
+        # Identify hidden_size and intermediate size for this layer
+        #   Get weight names for this layer
+        layer_weights_names = get_layer_weights(pruning_state,layer_idx)
+
+        #   Strat for MHA and FFN
+
+        mha_weight = get_matching_weights(layer_weights_names,"self.query.weight")
+        ffn_weight = get_matching_weights(layer_weights_names,"intermediate.dense.weight")
+
+        assert len(mha_weight) == 1 , f"{mha_weight}"
+        assert len(ffn_weight) == 1, f"{ffn_weight}"
+
+        mha_strat = pruning_state[ mha_weight[0] ].split("-")[-1]
+        ffn_strat = pruning_state[ ffn_weight[0] ].split("-")[-1]
+        
+
+        if(mha_strat.isnumeric() or ffn_strat.isnumeric()):
+            
+            print(f"Copying over weights")
+            print(f"MHA Compression = {mha_strat}")
+            mha_compression = int(mha_strat) if mha_strat.isnumeric() else 1
+            ffn_compression = int(ffn_strat) if ffn_strat.isnumeric() else 1
+
+            new_bert_layer = LowRankBertLayer(config, mha_compression, ffn_compression)
+            transfer_layer_weights(model,new_bert_layer,layer_idx)
+
+            print(f"Copied over weights for layer {layer_idx}")
+    
     trainer = Trainer(
             model=model,
             args=training_args,
@@ -524,6 +556,22 @@ def prune_and_evaluate_model(pruning_state, config, model_args, data_args,
         raise Exception("Now performance metric found!")
 
     return res
+def transfer_layer_weights(model, new_bert_layer, layer_idx):
+    # Access the specific layer in the full BERT model
+    source_layer = model.bert.encoder.layer[layer_idx]
+
+    # Iterate over the parameters of the source and target layers
+    source_params = list(source_layer.parameters())
+    target_params = list(new_bert_layer.parameters())
+
+    assert len(source_params) == len(target_params), "Number of parameters do not match between source and target layers"
+
+    for source_param, target_param in zip(source_params, target_params):
+        assert source_param.size() == target_param.size(), f"Parameter size mismatch: {source_param.size()} vs {target_param.size()}"
+        target_param.data.copy_(source_param.data)
+
+def get_matching_weights(weights,match_id):
+    return [weight for weight in weights if match_id in weight]
 
 def prune_model_modules(model,model_state):
     
@@ -532,12 +580,35 @@ def prune_model_modules(model,model_state):
         if(pruning_strat == "NOP"):
             continue
         
-        print(f"Pruning weight : {weight_name}")
+        #print(f"Pruning weight : {weight_name}")
 
         param_matrix = get_weight_by_name(model,weight_name)
-        print(f"Before {param_matrix.shape}")
+        #print(f"Before {param_matrix.shape}")
         pruned_param_matrix = prune_param_matrix(param_matrix,pruning_strat)
-        print(f"After {pruned_param_matrix.shape}")
+        #print(f"After {pruned_param_matrix.shape}")
+        set_weight_by_name(model, weight_name, pruned_param_matrix)
+
+def set_weight_by_name(model, weight_name, new_weight):
+    # Split the weight name into its components
+    name_parts = weight_name.split('.')
+    
+    # Navigate through the model's modules and sub-modules
+    module = model
+    for part in name_parts[:-1]:
+        if part.isdigit():
+            module = module[int(part)]
+        else:
+            module = getattr(module, part)
+    
+    # Get the current parameter
+    current_param = getattr(module, name_parts[-1])
+    
+    # Create a new parameter with the same properties as the current one
+    new_param = torch.nn.Parameter(new_weight.to(current_param.device), 
+                                   requires_grad=current_param.requires_grad)
+    
+    # Set the new parameter
+    setattr(module, name_parts[-1], new_param)
         
 def prune_param_matrix(param_matrix, pruning_strat):
     # Split the pruning strategy into its components
@@ -638,7 +709,7 @@ def get_layer_weights(pruning_state,layer_idx):
     
     layer_weights = []
     for k,v in pruning_state.items():
-        if(f"layer.{layer_idx}" in k):
+        if(f"layer.{layer_idx}." in k):
             layer_weights.append(k)
     return layer_weights
 
