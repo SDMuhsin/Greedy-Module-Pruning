@@ -318,7 +318,15 @@ def main():
         layers_to_prune = [int(l.replace("\n", "")) for l in layers_to_prune]
         print(f"Pruned {str(layers_to_prune)}")
         model.prune_layers(layers_to_prune)
-
+    elif(model_args.prune_method == "single-layer-prune"):
+        #current_path = pathlib.Path(__file__).parent.absolute()
+        layer_file_path = os.path.join("./", "layer_files/", f"{model.name_or_path}_{data_args.task_name}_single_layer.txt")
+        with open(layer_file_path, 'r') as f:
+            layers_to_prune = f.readlines()
+        layers_to_prune = layers_to_prune[:model_args.prune_n_layers]
+        layers_to_prune = [int(l.replace("\n", "")) for l in layers_to_prune]
+        print(f"Pruned {str(layers_to_prune)}")
+        model.prune_layers(layers_to_prune)
     elif(model_args.prune_method == "top-layers"):
         print(f"# Prune {model_args.prune_n_layers} layers with {model_args.prune_method}")
         first_layer_to_prune = config.num_hidden_layers - model_args.prune_n_layers

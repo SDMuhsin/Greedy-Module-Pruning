@@ -4,7 +4,7 @@ from tabulate import tabulate
 import statistics
 
 # Specify the variable parameters
-job_ids = ["prune-greedy-baselines"]
+job_ids = ["prune-greedy-baselines","single-layer"]
 prune_n_layers_list = [2,4,6]
 tasks = ["rte", "mrpc", "stsb", "sst2", "cola", "qnli","mnli","qqp"]
 models = ["bert-base-uncased", "roberta-base"]
