@@ -378,7 +378,7 @@ def main():
     # If the following line is uncommented, the dev set is used. Otherwise a 15% split of the training set is used.
     # eval_dataset = datasets["validation_matched" if data_args.task_name == "mnli" else "validation"]
 
-    train_size = int(len(train_dataset) * 0.85)
+    train_size = int(len(train_dataset) * 0.25)
     split_dataset = train_dataset.train_test_split(train_size=train_size, shuffle=True)
     train_dataset = split_dataset["train"]
     eval_dataset = split_dataset["test"]
@@ -452,7 +452,6 @@ def single_layer_prune(config, data_args, model_args, training_args, train_datas
         scores_per_layer[layer_idx] = res
 
     ''' Step 5 : Save the list of layers to prune'''
-    
     # The top layers are the best layers to prune, so least important layers should be on top, so store layers in ascending order
     sorted_layers = sorted(scores_per_layer, key=scores_per_layer.get)
     print("Layers ordered by worst to best performance {sorted_layers}")

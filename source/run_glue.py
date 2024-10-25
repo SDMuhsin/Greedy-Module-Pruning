@@ -309,7 +309,9 @@ def main():
     #
     # Prune model before training starts
     #
-    if(model_args.prune_method == "prune-greedy"):
+    if(model_args.prune_method == 'none'):
+        pass
+    elif(model_args.prune_method == "prune-greedy"):
         #current_path = pathlib.Path(__file__).parent.absolute()
         layer_file_path = os.path.join("./", "layer_files/", f"{model.name_or_path}_{data_args.task_name}_greedy.txt")
         with open(layer_file_path, 'r') as f:
@@ -512,7 +514,7 @@ def main():
 
             eval_results.update(eval_result)
     
-    folder_path = f"./saves/{data_args.job_id}-{model_args.prune_n_layers}"
+    folder_path = f"./saves/{model_args.prune_method}-{data_args.job_id}-{model_args.prune_n_layers}"
     pathlib.Path(folder_path).mkdir(exist_ok=True)
 
     eval_save_file_name = f"{folder_path}/results_rg_ensemble_{data_args.task_name}_{model_args.model_name_or_path}.json"

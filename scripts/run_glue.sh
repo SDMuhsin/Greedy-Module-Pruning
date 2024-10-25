@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # Define arrays for model names, seeds, and task names
-models=("bert-base-uncased" "roberta-base")
+models=("bert-base-uncased")
 seeds=(40 41 42 43 44)
 tasks=("mrpc" "rte" "stsb" "cola")
-prune_layers=(2 4 6)
+prune_layers=(4)
 
 # Generate the combinations and run them in parallel
 parallel -j 2 -u python3 ./source/run_glue.py \
@@ -20,5 +20,5 @@ parallel -j 2 -u python3 ./source/run_glue.py \
   --learning_rate 2e-5 \
   --task_name {3} \
   --prune_n_layers {4} \
-  --prune_method prune-greedy \
-  --job_id prune-greedy-baselines ::: "${models[@]}" ::: "${seeds[@]}" ::: "${tasks[@]}" ::: "${prune_layers[@]}"
+  --prune_method single-layer-prune \
+  --job_id single-layer ::: "${models[@]}" ::: "${seeds[@]}" ::: "${tasks[@]}" ::: "${prune_layers[@]}"
