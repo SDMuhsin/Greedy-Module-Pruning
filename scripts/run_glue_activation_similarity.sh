@@ -1,13 +1,13 @@
 #!/bin/bash
 
 # Define arrays for model names, seeds, and task names
-models=("bert-base-uncased" "roberta-base") 
+models=("roberta-base" "bert-base-uncased")
 seeds=(40 41 42 43 44)
-tasks=("mrpc" "rte" "stsb" "cola")
+tasks=("mrpc" "stsb" "cola" "rte")
 prune_layers=(4)
 
 # Generate the combinations and run them in parallel
-parallel -j 2 -u python3 ./source/run_glue.py \
+parallel -j 1 -u python3 ./source/run_glue.py \
   --output_dir experiments/tmp/{1}_{3}_seed{2}_prune{4} \
   --overwrite_output_dir \
   --model_name_or_path {1} \
@@ -20,5 +20,5 @@ parallel -j 2 -u python3 ./source/run_glue.py \
   --learning_rate 2e-5 \
   --task_name {3} \
   --prune_n_layers {4} \
-  --prune_method single-layer-prune \
-  --job_id single-layer ::: "${models[@]}" ::: "${seeds[@]}" ::: "${tasks[@]}" ::: "${prune_layers[@]}"
+  --prune_method activation-similarity \
+  --job_id v1 ::: "${models[@]}" ::: "${seeds[@]}" ::: "${tasks[@]}" ::: "${prune_layers[@]}"

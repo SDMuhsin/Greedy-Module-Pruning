@@ -378,7 +378,7 @@ def main():
     # If the following line is uncommented, the dev set is used. Otherwise a 15% split of the training set is used.
     # eval_dataset = datasets["validation_matched" if data_args.task_name == "mnli" else "validation"]
 
-    train_size = int(len(train_dataset) * 0.25)
+    train_size = int(len(train_dataset) * 0.1)
     split_dataset = train_dataset.train_test_split(train_size=train_size, shuffle=True)
     train_dataset = split_dataset["train"]
     eval_dataset = split_dataset["test"]
@@ -420,107 +420,209 @@ def main():
     #prune_fn(config, data_args, model_args, training_args, train_dataset,
     #        eval_dataset, compute_metrics, tokenizer, data_collator, datasets)
 
-    single_layer_prune(config, data_args, model_args, training_args, train_dataset,
+    activation_based_prune(config, data_args, model_args, training_args, train_dataset,
             eval_dataset, compute_metrics, tokenizer, data_collator, datasets)
-from torch.nn.functional import cosine_similarity
 
-class ActivationHook:
-    def __init__(self):
-        self.input_features = []
-        self.output_features = []
+import shutil
+from torch.nn.functional import cosine_similarity
+def compute_importance_score(inputs, outputs):
+    """
+    Compute layer importance based on how much it transforms its inputs.
+    
+    Theoretical Justification:
+    1. Wasserstein Distance (approximated by L2 of normalized vectors):
+       - Measures the "work" needed to transform input distribution to output
+       - Less transformation = less important layer
+       
+    2. KL Divergence proxy (via difference in statistical moments):
+       - Std deviation difference captures changes in distribution spread
+       - Significant changes in distribution = important transformations
+       
+    3. Information Flow (via cosine similarity):
+       - High similarity suggests information "flows through" unchanged
+       - Low similarity suggests significant feature transformation
+    
+    Returns:
+    - Higher score = more important layer (should be preserved)
+    """
+    # Flatten features for comparison
+    inputs_flat = inputs.reshape(inputs.size(0), -1)
+    outputs_flat = outputs.reshape(outputs.size(0), -1)
+    
+    # 1. Wasserstein distance approximation (using L2 of normalized vectors)
+    inputs_norm = inputs_flat / (inputs_flat.norm(dim=1, keepdim=True) + 1e-6)
+    outputs_norm = outputs_flat / (outputs_flat.norm(dim=1, keepdim=True) + 1e-6)
+    wasserstein_proxy = torch.norm(inputs_norm - outputs_norm, dim=1).mean()
+    
+    # 2. Distribution change via statistical moments
+    input_moments = torch.stack([
+        inputs_flat.mean(dim=1),
+        inputs_flat.std(dim=1),
+        torch.pow(inputs_flat, 3).mean(dim=1)  # Third moment (skewness)
+    ]).mean(dim=1)
+    
+    output_moments = torch.stack([
+        outputs_flat.mean(dim=1),
+        outputs_flat.std(dim=1),
+        torch.pow(outputs_flat, 3).mean(dim=1)  # Third moment (skewness)
+    ]).mean(dim=1)
+    
+    moment_diff = torch.norm(input_moments - output_moments)
+    
+    # 3. Cosine similarity (information flow)
+    cos_sim = cosine_similarity(inputs_flat, outputs_flat, dim=1).mean()
+    
+    # Combine metrics (higher score = more important)
+    importance = moment_diff#- cos_sim
+    
+    return importance.item()
+class DiskActivationHook:
+    def __init__(self, layer_idx):
+        self.layer_idx = layer_idx
+        self.save_dir = f'./saves/temp/layer_{layer_idx}'
+        self.input_count = 0
+        self.output_count = 0
+        
+        # Create directory structure
+        os.makedirs(f'{self.save_dir}/inputs', exist_ok=True)
+        os.makedirs(f'{self.save_dir}/outputs', exist_ok=True)
 
     def __call__(self, module, input_feat, output_feat):
-        # Store the mean across the batch dimension to save memory
-        self.input_features.append(input_feat[0].mean(dim=0).detach())
-        self.output_features.append(output_feat.mean(dim=0).detach())
+        try:
+            # Get hidden states
+            input_hidden = input_feat[0]
+            output_hidden = output_feat[0] if isinstance(output_feat, tuple) else output_feat
+            
+            # Save mean across batch dimension
+            input_mean = input_hidden.mean(dim=0).detach().cpu()
+            output_mean = output_hidden.mean(dim=0).detach().cpu()
+            
+            # Save to disk
+            torch.save(input_mean, f'{self.save_dir}/inputs/{self.input_count}.pt')
+            torch.save(output_mean, f'{self.save_dir}/outputs/{self.output_count}.pt')
+            
+            self.input_count += 1
+            self.output_count += 1
+            
+            if self.input_count % 100 == 0:  # Log less frequently
+                print(f"Layer {self.layer_idx} - Saved {self.input_count} samples")
+                
+        except Exception as e:
+            print(f"Error in hook for layer {self.layer_idx}")
+            print(f"Input type: {type(input_feat)}, shape: {[t.shape if torch.is_tensor(t) else type(t) for t in input_feat]}")
+            print(f"Output type: {type(output_feat)}")
+            raise e
+
+    def load_features(self):
+        """Load all features from disk and stack them"""
+        inputs = []
+        outputs = []
+        
+        for i in range(self.input_count):
+            inputs.append(torch.load(f'{self.save_dir}/inputs/{i}.pt'))
+            outputs.append(torch.load(f'{self.save_dir}/outputs/{i}.pt'))
+            
+            # Free memory periodically
+            if i % 100 == 99:
+                torch.cuda.empty_cache()
+        
+        return torch.stack(inputs), torch.stack(outputs)
 
 def activation_based_prune(config, data_args, model_args, training_args, train_dataset,
     eval_dataset, compute_metrics, tokenizer, data_collator, datasets):
-    ''' Step 1: Create and fine-tune the model '''
-    model = create_model(config, model_args)
-    _ = just_evaluate_model(model, config, model_args, data_args,
-                training_args, train_dataset, eval_dataset, compute_metrics, 
-                tokenizer, data_collator, datasets)
+    print("\n=== Starting Memory-Efficient Activation-based Pruning ===")
     
-    ''' Step 2: Attach hooks to each transformer layer '''
-    hooks = {}
-    activation_collectors = {}
+    # Create temp directory
+    os.makedirs('./saves/temp', exist_ok=True)
     
-    # Handle both BERT and RoBERTa architectures
-    if hasattr(model, 'bert'):
-        layers = model.bert.encoder.layer
-    elif hasattr(model, 'roberta'):
-        layers = model.roberta.encoder.layer
-    else:
-        raise ValueError("Unsupported model architecture")
+    try:
+        ''' Steps 1-2: Same as before '''
+        print("\nStep 1: Creating and fine-tuning model...")
+        model = create_model(config, model_args)
+        _ = just_evaluate_model(model, config, model_args, data_args,
+                    training_args, train_dataset, eval_dataset, compute_metrics, 
+                    tokenizer, data_collator, datasets)
+        
+        print("\nStep 2: Attaching disk-saving activation hooks...")
+        hooks = {}
+        activation_collectors = {}
+        
+        if hasattr(model, 'bert'):
+            print("Detected BERT architecture")
+            layers = model.bert.encoder.layer
+        elif hasattr(model, 'roberta'):
+            print("Detected RoBERTa architecture")
+            layers = model.roberta.encoder.layer
+        else:
+            raise ValueError("Unsupported model architecture")
+        
+        print(f"Found {len(layers)} layers")
+        
+        for idx, layer in enumerate(layers):
+            collector = DiskActivationHook(idx)
+            activation_collectors[idx] = collector
+            hooks[idx] = layer.register_forward_hook(collector)
+            print(f"Attached hook to layer {idx}")
 
-    for idx, layer in enumerate(layers):
-        collector = ActivationHook()
-        activation_collectors[idx] = collector
-        # Register hook on the entire layer module
-        hooks[idx] = layer.register_forward_hook(collector)
+        ''' Step 3: Same as before '''
+        print("\nStep 3: Collecting activations through evaluation...")
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            eval_dataset=eval_dataset,
+            compute_metrics=compute_metrics,
+            tokenizer=tokenizer,
+            data_collator=data_collator,
+        )
+        trainer.evaluate()
 
-    ''' Step 3: Run evaluation to collect activations '''
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        eval_dataset=eval_dataset,
-        compute_metrics=compute_metrics,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-    )
-    trainer.evaluate()
+        ''' Step 4: Calculate importance scores '''
+        print("\nStep 4: Computing layer importance scores...")
+        importance_scores = {}
+        
+        for layer_idx, collector in activation_collectors.items():
+            print(f"\nProcessing layer {layer_idx}")
+            try:
+                # Load features from disk
+                inputs, outputs = collector.load_features()
+                print(f"Loaded features for layer {layer_idx}:")
+                print(f"Input tensor shape: {inputs.shape}")
+                print(f"Output tensor shape: {outputs.shape}")
+                
+                importance = compute_importance_score(inputs, outputs)
+                importance_scores[layer_idx] = importance
+                
+                print(f"Layer {layer_idx} importance score: {importance:.4f}")
+                
+            except Exception as e:
+                print(f"Error processing layer {layer_idx}: {str(e)}")
+                raise e
+            finally:
+                # Clean up hooks
+                hooks[layer_idx].remove()
 
-    ''' Step 4: Calculate importance scores '''
-    importance_scores = {}
-    
-    for layer_idx, collector in activation_collectors.items():
-        # Stack all collected features
-        inputs = torch.stack(collector.input_features)
-        outputs = torch.stack(collector.output_features)
+        ''' Step 5: Same as before '''
+        print("\nStep 5: Saving layer ordering...")
+        sorted_layers = [k for k, v in sorted(importance_scores.items(), key=lambda x: x[1])]
         
-        # Calculate importance score based on three metrics:
-        # 1. Cosine similarity between input and output
-        # 2. L2 distance between normalized input and output
-        # 3. Difference in standard deviation (measure of information spread)
+        print("\nFinal Results:")
+        print("Layers ordered by importance (least to most):", sorted_layers)
+        print("\nImportance scores:")
+        for idx in sorted_layers:
+            print(f"Layer {idx}: {importance_scores[idx]:.4f}")
         
-        # Flatten the features for comparison
-        inputs_flat = inputs.reshape(inputs.size(0), -1)
-        outputs_flat = outputs.reshape(outputs.size(0), -1)
+        output_file = f'./layer_files/{model_args.model_name_or_path}_{data_args.task_name}_activation.txt'
+        print(f"\nSaving results to: {output_file}")
         
-        # 1. Cosine similarity (higher means more similar, thus less important)
-        cos_sim = cosine_similarity(inputs_flat, outputs_flat, dim=1).mean()
+        with open(output_file, 'w') as f:
+            f.writelines("%s\n" % l for l in sorted_layers)
         
-        # 2. L2 distance of normalized vectors (lower means more similar)
-        inputs_norm = inputs_flat / inputs_flat.norm(dim=1, keepdim=True)
-        outputs_norm = outputs_flat / outputs_flat.norm(dim=1, keepdim=True)
-        l2_dist = torch.norm(inputs_norm - outputs_norm, dim=1).mean()
+        return None
         
-        # 3. Change in standard deviation (higher means more transformation)
-        input_std = inputs_flat.std(dim=1).mean()
-        output_std = outputs_flat.std(dim=1).mean()
-        std_diff = abs(output_std - input_std)
-        
-        # Combine metrics into final importance score
-        # Higher score means more important (should be preserved)
-        importance = l2_dist + std_diff - cos_sim
-        importance_scores[layer_idx] = importance.item()
-        
-        # Clean up hooks
-        hooks[layer_idx].remove()
-
-    ''' Step 5: Save layers ordered by importance '''
-    # Sort layers by importance (ascending = least important first)
-    sorted_layers = [k for k, v in sorted(importance_scores.items(), key=lambda x: x[1])]
-    
-    print("Layers ordered by worst to best performance:", sorted_layers)
-    print("Importance scores:", {idx: importance_scores[idx] for idx in sorted_layers})
-    
-    # Save to file with activation in the name to distinguish from single layer approach
-    with open(f'./layer_files/{model_args.model_name_or_path}_{data_args.task_name}_activation.txt', 'w') as f:
-        f.writelines("%s\n" % l for l in sorted_layers)
-    
-    return None
+    finally:
+        # Clean up temp directory
+        print("\nCleaning up temporary files...")
+        shutil.rmtree('./saves/temp', ignore_errors=True)
 
 def single_layer_prune(config, data_args, model_args, training_args, train_dataset,
     eval_dataset, compute_metrics, tokenizer, data_collator, datasets):

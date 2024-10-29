@@ -4,7 +4,7 @@ from tabulate import tabulate
 import statistics
 
 # Specify the variable parameters
-job_ids = ["prune-greedy-baselines","single-layer"]
+job_ids = ["prune-greedy-baselines","activation-similarity-v1"]
 prune_n_layers_list = [2,4,6]
 tasks = ["rte", "mrpc", "stsb", "sst2", "cola", "qnli","mnli","qqp"]
 models = ["bert-base-uncased", "roberta-base"]
@@ -59,7 +59,7 @@ for model in models:
             for task in tasks:
                 file_name = f"results_rg_ensemble_{task}_{model}.json"
                 file_path = os.path.join(base_dir, f"{job_id}-{prune_n_layers}", file_name)
-                
+                print(file_path) 
                 cell_value = process_json_file(file_path, task)
                 row.append(cell_value)
             table_data.append(row)
